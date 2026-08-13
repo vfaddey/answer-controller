@@ -31,12 +31,13 @@ class ProcessEventInteractor:
         try:
             existing = await self._events.get(command.event_id)
             if existing is not None:
-                await self._tm.rollback()
-                return ProcessEventResult(
+                result = ProcessEventResult(
                     event_id=existing.event_id,
                     ticket_id=existing.ticket_id,
                     duplicate=True,
                 )
+                await self._tm.rollback()
+                return result
             ticket = None
             if isinstance(command.payload, EmployeeResponse):
                 ticket = await self._tickets.get_for_update_by_message_id(
