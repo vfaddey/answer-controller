@@ -1,70 +1,27 @@
 import asyncio
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-import pytest
-from dishka import Provider, Scope, make_async_container, provide
-from dishka.integrations.fastapi import FastapiProvider, setup_dishka
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 
-from answer_controller.application.interactors import (
-    GetMetricsInteractor,
-    HealthInteractor,
-    ListTicketsInteractor,
-    ProcessEventInteractor,
-)
-from answer_controller.domain.entities import Ticket
-from answer_controller.presentation.api import router
+from answer_controller.application.dto import CustomerMessage, ProcessEventCommand
+from answer_controller.application.interactors import ProcessEventInteractor
+from answer_controller.domain.entities import IncomingEvent
+from answer_controller.domain.enums import EventType
 from tests.integration.fakes import (
     InMemoryEventRepository,
     InMemoryTicketRepository,
     NoopTransactionManager,
-    ReadyHealthRepository,
 )
 
 
-class ApplicationProvider(Provider):
-    def __init__(
-        self,
-        events: InMemoryEventRepository,
-        tickets: InMemoryTicketRepository,
-    ) -> None:
-        super().__init__()
-        self._events = events
-        self._tickets = tickets
+class ExpiringRollbackTransactionManager(NoopTransactionManager):
+    def __init__(self, event: IncomingEvent) -> None:
+        self._event = event
 
-    @provide(scope=Scope.REQUEST)
-    def process_event(self) -> ProcessEventInteractor:
-        return ProcessEventInteractor(self._events, self._tickets, NoopTransactionManager())
-
-    @provide(scope=Scope.REQUEST)
-    def list_tickets(self) -> ListTicketsInteractor:
-        return ListTicketsInteractor(self._tickets)
-
-    @provide(scope=Scope.REQUEST)
-    def get_metrics(self) -> GetMetricsInteractor:
-        return GetMetricsInteractor(self._tickets)
-
-    @provide(scope=Scope.REQUEST)
-    def health(self) -> HealthInteractor:
-        return HealthInteractor(ReadyHealthRepository())
-
-
-@pytest.fixture
-async def api() -> AsyncIterator[
-    tuple[AsyncClient, InMemoryEventRepository, InMemoryTicketRepository]
-]:
-    events = InMemoryEventRepository()
-    tickets = InMemoryTicketRepository()
-    app = FastAPI()
-    app.include_router(router)
-    container = make_async_container(ApplicationProvider(events, tickets), FastapiProvider())
-    setup_dishka(container, app)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        yield client, events, tickets
-    await container.close()
+    async def rollback(self) -> None:
+        self._event.event_id = "expired"
+        self._event.ticket_id = uuid4()
 
 
 async def test_concurrent_event_delivery_creates_one_ticket(
@@ -134,32 +91,118 @@ async def test_concurrent_event_delivery_creates_one_ticket(
     assert duplicate_with_changed_body.json()["duplicate"] is True
 
 
-async def test_metrics_endpoint_returns_fixed_dataset(
+async def test_metrics_use_crm_occurred_at_and_include_answered_overdue(
     api: tuple[AsyncClient, InMemoryEventRepository, InMemoryTicketRepository],
 ) -> None:
-    client, _, tickets = api
+    client, _, _ = api
     now = datetime.now(UTC)
-    first = Ticket(uuid4(), uuid4(), "c-1", "chat", "sales", "One", now - timedelta(minutes=10))
-    second = Ticket(uuid4(), uuid4(), "c-2", "chat", "sales", "Two", now - timedelta(minutes=9))
-    overdue = Ticket(
-        uuid4(), uuid4(), "c-3", "chat", "support", "Three", now - timedelta(minutes=8)
-    )
-    first.close(first.created_at + timedelta(seconds=20))
-    second.close(second.created_at + timedelta(seconds=40))
-    tickets.tickets = {ticket.id: ticket for ticket in (first, second, overdue)}
+    messages = [uuid4() for _ in range(4)]
+    customer_times = [
+        now - timedelta(hours=4),
+        now - timedelta(hours=3),
+        now - timedelta(hours=2),
+        now - timedelta(hours=1),
+    ]
+
+    for index, (message_id, occurred_at) in enumerate(zip(messages, customer_times, strict=True)):
+        response = await client.post(
+            "/api/events",
+            json={
+                "event_id": str(uuid4()),
+                "event_type": "customer_message",
+                "occurred_at": occurred_at.isoformat(),
+                "payload": {
+                    "message_id": str(message_id),
+                    "client_id": f"customer-{index}",
+                    "channel": "chat",
+                    "direction": "support",
+                    "text": f"Question {index}",
+                },
+            },
+        )
+        assert response.status_code == 201
+
+    for message_id, customer_time, response_seconds in zip(
+        messages,
+        customer_times,
+        (60, 3600, 7200),
+        strict=False,
+    ):
+        response = await client.post(
+            "/api/events",
+            json={
+                "event_id": str(uuid4()),
+                "event_type": "employee_response",
+                "occurred_at": (customer_time + timedelta(seconds=response_seconds)).isoformat(),
+                "payload": {
+                    "reply_to_message_id": str(message_id),
+                    "employee_id": "employee-1",
+                    "text": "Answer",
+                },
+            },
+        )
+        assert response.status_code == 201
 
     response = await client.get(
         "/api/metrics",
         params={
-            "date_from": (now - timedelta(hours=1)).isoformat(),
-            "date_to": (now + timedelta(minutes=1)).isoformat(),
+            "date_from": (now - timedelta(hours=5)).isoformat(),
+            "date_to": (now + timedelta(hours=1)).isoformat(),
         },
     )
 
     assert response.status_code == 200
     assert response.json() == {
-        "created": 3,
-        "answered": 2,
-        "overdue": 1,
-        "median_first_response_seconds": 30.0,
+        "created": 4,
+        "answered": 3,
+        "overdue": 3,
+        "median_first_response_seconds": 3600.0,
     }
+
+    empty = await client.get(
+        "/api/metrics",
+        params={
+            "date_from": (now + timedelta(days=1)).isoformat(),
+            "date_to": (now + timedelta(days=2)).isoformat(),
+        },
+    )
+    assert empty.status_code == 200
+    assert empty.json() == {
+        "created": 0,
+        "answered": 0,
+        "overdue": 0,
+        "median_first_response_seconds": None,
+    }
+
+
+async def test_duplicate_result_is_copied_before_transaction_rollback() -> None:
+    event_id = str(uuid4())
+    ticket_id = uuid4()
+    now = datetime.now(UTC)
+    existing = IncomingEvent.create(
+        event_id,
+        EventType.CUSTOMER_MESSAGE,
+        now,
+        {},
+        ticket_id,
+    )
+    events = InMemoryEventRepository()
+    events.events[event_id] = existing
+    interactor = ProcessEventInteractor(
+        events,
+        InMemoryTicketRepository(),
+        ExpiringRollbackTransactionManager(existing),
+    )
+
+    result = await interactor.execute(
+        ProcessEventCommand(
+            event_id=event_id,
+            event_type=EventType.CUSTOMER_MESSAGE,
+            occurred_at=now,
+            payload=CustomerMessage(uuid4(), "customer", "chat", "sales", "Help"),
+        ),
+    )
+
+    assert result.event_id == event_id
+    assert result.ticket_id == ticket_id
+    assert result.duplicate is True
