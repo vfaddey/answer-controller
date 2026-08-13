@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Контроль ответов</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <p class="eyebrow">Operations desk</p>
+        <h1>Контроль ответов</h1>
+        <p class="subtitle">Открытые обращения и текущий SLA в реальном времени</p>
+      </div>
+      <div class="live"><span></span> Обновляется автоматически</div>
+    </header>
+    <section class="metrics" aria-label="Показатели">
+      <article><span>Создано за 24 часа</span><strong id="created">—</strong></article>
+      <article><span>Получили ответ</span><strong id="answered">—</strong></article>
+      <article><span>Просрочено</span><strong id="overdue">—</strong></article>
+      <article><span>Медиана ответа</span><strong id="median">—</strong></article>
+    </section>
+    <section class="board">
+      <div class="toolbar">
+        <div><h2>Требуют внимания</h2><p id="summary">Загрузка…</p></div>
+        <label>Направление<input id="direction" placeholder="Все направления"></label>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Клиент / канал</th><th>Направление</th><th>Сообщение</th><th>Ожидание</th><th>Статус</th></tr></thead>
+          <tbody id="tickets"></tbody>
+        </table>
+      </div>
+      <div id="empty" class="empty" hidden>Открытых обращений нет</div>
+      <div id="error" class="error" hidden>Не удалось обновить данные. Повторим попытку автоматически.</div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
